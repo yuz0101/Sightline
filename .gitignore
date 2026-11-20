@@ -1,0 +1,27 @@
+# Build products
+.build/
+build/
+*.dSYM/
+.swiftpm/
+
+# Local scratch space used by Scripts/build_app.sh
+.scratch/
+
+# Local signing material and the vendored Sparkle framework
+.secrets/
+.env
+.env.*
+*.p8
+*.p12
+*.pfx
+*.pem
+*.key
+*.cer
+*.certSigningRequest
+*.provisionprofile
+*.mobileprovision
+xcuserdata/
+Vendor/Sparkle/
+
+# macOS
+.DS_Store
