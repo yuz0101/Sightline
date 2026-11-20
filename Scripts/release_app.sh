@@ -32,7 +32,7 @@ case "$IDENTITY" in
 	*) echo "error: a Developer ID Application identity is required" >&2; exit 1 ;;
 esac
 SIGHTLINE_BUILD_DIR="$STAGING" SIGHTLINE_SIGN_IDENTITY="$IDENTITY" SIGHTLINE_UNIVERSAL_BUILD=1 "$ROOT/Scripts/build_app.sh"
-lipo -verify_arch arm64 x86_64 "$APP/Contents/MacOS/Sightline"
+lipo "$APP/Contents/MacOS/Sightline" -verify_arch arm64 x86_64
 echo "==> notarizing (this uploads to Apple and can take a few minutes)"
 rm -f "$ROOT/build/Sightline.zip"
 /usr/bin/ditto -c -k --norsrc --noextattr --noqtn --keepParent "$APP" "$ROOT/build/Sightline.zip"
