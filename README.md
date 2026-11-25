@@ -8,7 +8,7 @@ If a test fails, **drag the terminal by its title bar until the centre pane ligh
 
 [Download Sightline for Mac](https://github.com/yuz0101/Sightline/releases/latest/download/Sightline.zip) · macOS 14 Sonoma or later · Apple silicon and Intel
 
-The faster drag response and keyboard swap in the demos were added after v0.1.0. [Try them from source](CONTRIBUTING.md#build-and-test).
+This release includes faster drag snapping and the keyboard swap shown in the demos. [Release notes for v0.0.1](https://github.com/yuz0101/Sightline/releases/tag/v0.0.1).
 
 <picture>
   <source media="(prefers-reduced-motion: reduce)" srcset="docs/assets/window-swap-still.png">
