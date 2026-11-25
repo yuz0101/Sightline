@@ -22,8 +22,8 @@ final class SettingsWindowController {
         model.refreshTrust()
     }
 
-    func setUnavailableShortcuts(_ actions: [HotKeyAction]) {
-        model.setUnavailable(actions)
+    func refreshVisiblePermissionStatus() {
+        if window?.isVisible == true { model.refreshTrust() }
     }
 
     func show() {
@@ -39,7 +39,7 @@ final class SettingsWindowController {
                 backing: .buffered,
                 defer: false
             )
-            window.title = "Sightline"
+            window.title = Accessibility.appName
             window.contentView = hosting
             window.minSize = NSSize(width: 780, height: 620)
             window.isReleasedWhenClosed = false

@@ -37,6 +37,15 @@ final class SnapController {
     /// Rotating queue of the windows that belong on the centre stage, front first.
     private var stages: [String: [WindowKey]] = [:]
 
+    private let swapOverlay = BoardOverlay()
+    private struct SwapPreview {
+        let screen: ScreenInfo
+        let geometry: LayoutGeometry
+        let windows: [Slot: VisibleWindow]
+        var slot: Slot?
+    }
+    private var swapPreview: SwapPreview?
+
     var onStatus: ((String, CGRect?) -> Void)?
 
     init(driver: WindowDriver, displays: DisplayRegistry, prefs: Preferences) {
@@ -89,100 +98,126 @@ final class SnapController {
             return false
         }
 
-        // A move never evicts: whoever holds the target slot takes the mover's
-        // old place, or the mover's old frame if the mover was floating.
-        if let occupant = currentOccupant(of: canonical, on: screen, excluding: window.key) {
-            let previous = assignments[window.key].flatMap { $0.displayID == screen.id ? $0 : nil }
-            let source = swapFrom.map { geo.layout.splitSides ? $0 : geo.canonical($0) }
-            let oldFrame = driver.frame(of: window.element)
-            var relocated = false
-
-            if let source, source != canonical, let sourceRect = geo.rect(for: source) {
-                // A drag swap: the board the window came from is measured from where
-                // the drag started, and it wins over a stale assignment — the window
-                // may have been moved by hand since Sightline last placed it.
-                relocated = driver.setFrame(boardRect(sourceRect, on: screen), of: occupant.element)
-                if relocated {
-                    assignments[occupant.key] = Placement(displayID: screen.id, slot: source)
-                    prefs.remember(source, bundleID: occupant.bundleID, displayID: screen.id)
-                }
-            } else if let previous, geo.canonical(previous.slot) != canonical,
-               let sourceRect = geo.rect(for: previous.slot) {
-                relocated = driver.setFrame(boardRect(sourceRect, on: screen), of: occupant.element)
-                if relocated {
-                    assignments[occupant.key] = Placement(displayID: screen.id, slot: previous.slot)
-                    prefs.remember(previous.slot, bundleID: occupant.bundleID, displayID: screen.id)
-                }
-            } else if let oldFrame {
-                let fallback = Self.clamp(oldFrame, into: screen.frame)
-                relocated = driver.setFrame(fallback, of: occupant.element)
-                if relocated { assignments[occupant.key] = nil }
-            }
-
-            if !relocated {
-                // Keep it visible and out of the way; it stays a stage candidate.
-                assignments[occupant.key] = nil
-                pushStage(occupant.key, displayID: screen.id)
-            }
+        // Capture the destination before the dragged window covers it. Resizing
+        // the window under the pointer comes first, even if its neighbour is slow.
+        // WindowServer can be one frame behind a just-completed placement.
+        // Include its visible window ID and check its live AX frame below.
+        let tracked = assignments.compactMap { key, placement -> VisibleWindow? in
+            guard placement.displayID == screen.id, geo.canonical(placement.slot) == canonical,
+                  let number = key.number else { return nil }
+            return VisibleWindow(pid: key.pid, number: number)
         }
+        let candidates = driver.visibleWindows().filter { candidate in
+            guard candidate.window.pid != window.key.pid || candidate.window.number != window.key.number else { return false }
+            return WindowDriver.matches(candidate.frame, raw, tolerance: 8) || tracked.contains(candidate.window)
+        }
+        let previous = assignments[window.key].flatMap { $0.displayID == screen.id ? $0.slot : nil }
+        let source = (swapFrom ?? previous).map(geo.canonical)
+        let oldFrame = candidates.isEmpty ? nil : driver.frame(of: window.element)
 
         driver.ensureVisible(window)
         guard driver.setFrame(target, of: window.element) else {
+            if let oldFrame { driver.setFrame(oldFrame, of: window.element) }
             report("Couldn't resize \(window.appName) to fit")
             return false
         }
 
-        assignments[window.key] = Placement(displayID: screen.id, slot: slot)
-        prefs.remember(slot, bundleID: window.bundleID, displayID: screen.id)
-        if canonical == .center {
-            if updateStage { pushStage(window.key, displayID: screen.id) }
+        for candidate in candidates {
+            guard let occupant = driver.resolve(candidate.window, in: raw, excluding: window) else { continue }
+            if let source, source != canonical, let sourceRect = geo.rect(for: source),
+               driver.setFrame(boardRect(sourceRect, on: screen), of: occupant.element) {
+                remember(occupant, in: source, on: screen)
+            } else if source == nil || source == canonical, let oldFrame,
+                      driver.setFrame(Self.clamp(oldFrame, into: screen.frame), of: occupant.element) {
+                assignments[occupant.key] = nil
+            } else {
+                assignments[occupant.key] = nil
+                pushStage(occupant.key, displayID: screen.id)
+            }
+            break
         }
-        driver.focus(window)
-        report("\(slot.label) · \(shortTitle(window))", over: target)
+
+        // A closed or manually moved window may still claim this board. Once
+        // filled, it must not pull a stale occupant back on the next reflow.
+        assignments = assignments.filter { _, placement in
+            placement.displayID != screen.id || geo.canonical(placement.slot) != canonical
+        }
+        finishPlacement(window, in: slot, on: screen, target: target, updateStage: updateStage)
         return true
     }
 
-    /// The board this window is tracked on, if it still sits there. Used by
-    /// drag-to-snap: a window that already belongs to a board can be moved
-    /// between boards with a plain drag, no modifier needed.
-    func trackedSlot(for window: AXWindow, on screen: ScreenInfo) -> Slot? {
-        guard let placement = assignments[window.key], placement.displayID == screen.id,
-              let expected = geometry(for: screen).rect(for: placement.slot),
-              let frame = driver.frame(of: window.element),
-              WindowDriver.matches(frame, expected, tolerance: 8) else { return nil }
-        return placement.slot
+    private func remember(_ window: AXWindow, in slot: Slot, on screen: ScreenInfo) {
+        assignments[window.key] = Placement(displayID: screen.id, slot: slot)
+        prefs.remember(slot, bundleID: window.bundleID, displayID: screen.id)
     }
 
-    private func currentOccupant(of canonical: Slot, on screen: ScreenInfo, excluding key: WindowKey) -> AXWindow? {
-        let geo = geometry(for: screen)
-        var stale: [WindowKey] = []
-        var tracked: AXWindow?
+    private func finishPlacement(_ window: AXWindow, in slot: Slot, on screen: ScreenInfo,
+                                 target: CGRect, updateStage: Bool = true) {
+        remember(window, in: slot, on: screen)
+        if slot == .center && updateStage { pushStage(window.key, displayID: screen.id) }
+        driver.focus(window)
+        report("\(slot.label) · \(shortTitle(window))", over: target)
+    }
 
-        for (candidate, placement) in assignments {
-            guard candidate != key, placement.displayID == screen.id,
-                  geo.canonical(placement.slot) == canonical else { continue }
-            guard let expected = geo.rect(for: placement.slot),
-                  let window = driver.resolve(candidate),
-                  let frame = driver.frame(of: window.element),
-                  WindowDriver.matches(frame, expected, tolerance: 4) else {
-                stale.append(candidate)
-                continue
+    func handleCentreSwap(_ update: CentreSwapUpdate) {
+        switch update {
+        case .preview(let selection):
+            if swapPreview == nil, let screen = activeScreen() {
+                let geometry = geometry(for: screen)
+                swapPreview = SwapPreview(screen: screen, geometry: geometry, windows: driver.visibleOccupants(of: geometry))
             }
-            tracked = window
-            break
+            guard var preview = swapPreview else { return }
+            preview.slot = selection.slot(among: Set(preview.windows.keys))
+            swapPreview = preview
+            if let slot = preview.slot {
+                swapOverlay.show(screen: preview.screen, boards: preview.geometry.boards, highlight: slot)
+            } else {
+                swapOverlay.hide()
+            }
+        case .commit, .cancel:
+            let preview = swapPreview
+            swapPreview = nil
+            swapOverlay.hide()
+            if update == .commit, let preview, let slot = preview.slot {
+                commitCentreSwap(preview, from: slot)
+            }
         }
-        for staleKey in stale { assignments[staleKey] = nil }
-        if let tracked { return tracked }
+    }
 
-        // Visual fallback: a window that already sits in the slot but was placed
-        // before Sightline started tracking it.
-        guard let expected = geo.rect(for: canonical) else { return nil }
-        for window in driver.allWindows() where window.key != key {
-            guard let frame = driver.frame(of: window.element),
-                  WindowDriver.matches(frame, expected, tolerance: 8) else { continue }
-            return window
+    private func commitCentreSwap(_ preview: SwapPreview, from slot: Slot) {
+        // A Space change, a closed window or a layout edit while holding the
+        // chord must never exchange a different pair from the one previewed.
+        guard let screen = displays.screen(id: preview.screen.id) else { return }
+        let geometry = geometry(for: screen)
+        guard geometry.rects == preview.geometry.rects,
+              let sideRect = geometry.rect(for: slot), let centreRect = geometry.rect(for: .center),
+              let source = preview.windows[slot] else { return }
+        let current = driver.visibleOccupants(of: geometry)
+        guard current[slot] == source, current[.center] == preview.windows[.center],
+              let incoming = driver.resolve(source, in: sideRect),
+              let oldSide = driver.frame(of: incoming.element) else { return }
+
+        let centreTarget = boardRect(centreRect, on: screen)
+        let sideTarget = boardRect(sideRect, on: screen)
+        var displaced: (window: AXWindow, frame: CGRect)?
+        if let visible = current[.center] {
+            guard let window = driver.resolve(visible, in: centreRect),
+                  let original = driver.frame(of: window.element) else { return }
+            guard driver.setFrame(sideTarget, of: window.element) else {
+                driver.setFrame(original, of: window.element)
+                report("Couldn’t fit \(window.appName) in the side pane", over: sideTarget)
+                return
+            }
+            displaced = (window, original)
         }
-        return nil
+        guard driver.setFrame(centreTarget, of: incoming.element) else {
+            driver.setFrame(oldSide, of: incoming.element)
+            if let displaced { driver.setFrame(displaced.frame, of: displaced.window.element) }
+            report("Couldn’t fit \(incoming.appName) in the centre pane", over: centreTarget)
+            return
+        }
+        if let displaced { remember(displaced.window, in: slot, on: screen) }
+        finishPlacement(incoming, in: .center, on: screen, target: centreTarget)
     }
 
     // MARK: - One-click arrange
@@ -388,7 +423,7 @@ final class SnapController {
             stages[screen.id] = list
         }
         guard !list.isEmpty else {
-            report("The stage is empty — focus a window and press \(HotKeyAction.stageFocused.shortcut)")
+            report("Choose Centre stage → Stage focused window to add a window")
             return
         }
         guard list.count > 1 else {
@@ -442,19 +477,6 @@ final class SnapController {
         guard let screen = activeScreen() else { return }
         prefs.nudgeCenterFraction(by: delta, displayID: screen.id)
         report("Centre \(Int((prefs.layout(for: screen.id).centerFraction * 100).rounded()))%")
-    }
-
-    func stepPreset(_ direction: Int) {
-        guard let screen = activeScreen() else { return }
-        let presets = LayoutPreset.all
-        let current = layout(for: screen).centerFraction
-        let index = presets.firstIndex { abs($0.centerFraction - current) < 0.005 } ?? 2
-        let target = min(max(index + direction, 0), presets.count - 1)
-        guard target != index else { return }
-        var updated = layout(for: screen)
-        updated.centerFraction = presets[target].centerFraction
-        prefs.setLayout(updated, for: screen.id)
-        report("\(presets[target].name) · \(Int(presets[target].centerFraction * 100))%")
     }
 
     func apply(preset: LayoutPreset, to screen: ScreenInfo) {

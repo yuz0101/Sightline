@@ -55,6 +55,15 @@ lipo -create "${BINS[@]}" -output "$EXE"
 install_name_tool -delete_rpath "$ROOT/Vendor/Sparkle" "$EXE"
 strip -S -x "$EXE"
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
+# A side-by-side development build needs its own identity in Privacy & Security.
+# Set SIGHTLINE_PREVIEW_NAME to the name the user will see in Accessibility.
+if [ -n "${SIGHTLINE_PREVIEW_NAME:-}" ]; then
+	BUNDLE_ID="$BUNDLE_ID.preview"
+	/usr/bin/plutil -replace CFBundleIdentifier -string "$BUNDLE_ID" "$APP/Contents/Info.plist"
+	/usr/bin/plutil -replace CFBundleName -string "$SIGHTLINE_PREVIEW_NAME" "$APP/Contents/Info.plist"
+	/usr/bin/plutil -replace CFBundleDisplayName -string "$SIGHTLINE_PREVIEW_NAME" "$APP/Contents/Info.plist"
+	/usr/bin/plutil -remove SUFeedURL "$APP/Contents/Info.plist"
+fi
 cp "$ROOT/Vendor/Sparkle/LICENSE" "$APP/Contents/Resources/Sparkle-LICENSE"
 cp -R "$ROOT/Vendor/Sparkle/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
 

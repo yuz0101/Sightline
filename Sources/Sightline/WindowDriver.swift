@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import SightlineCore
 
 /// Identity of a window that survives AX round-trips. Chromium-based apps do not
 /// answer `_AXUIElementGetWindow` in some versions, so the title is used as a
@@ -21,6 +22,11 @@ struct WindowKey: Hashable {
     }
 }
 
+struct VisibleWindow: Equatable {
+    let pid: pid_t
+    let number: CGWindowID
+}
+
 struct AXWindow {
     let element: AXUIElement
     let key: WindowKey
@@ -34,6 +40,7 @@ struct AXWindow {
 
 enum Accessibility {
     static var isTrusted: Bool { AXIsProcessTrusted() }
+    static let appName = Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "Sightline"
 
     static func requestPrompt() {
         let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
@@ -53,7 +60,10 @@ final class WindowDriver {
 
     private let getWindowIDFn: GetWindowIDFn?
 
-    init() {
+    private let onlyOwnWindows: Bool
+
+    init(onlyOwnWindows: Bool = false) {
+        self.onlyOwnWindows = onlyOwnWindows
         // Private but stable since 10.10; used by every window manager.
         if let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementGetWindow") {
             getWindowIDFn = unsafeBitCast(symbol, to: GetWindowIDFn.self)
@@ -95,9 +105,19 @@ final class WindowDriver {
     // MARK: - Geometry
 
     func frame(of element: AXUIElement) -> CGRect? {
-        guard let positionValue = copy(element, kAXPositionAttribute),
-              let sizeValue = copy(element, kAXSizeAttribute),
-              CFGetTypeID(positionValue) == AXValueGetTypeID(),
+        let attributes = [kAXPositionAttribute, kAXSizeAttribute] as CFArray
+        var result: CFArray?
+        let values: [CFTypeRef]
+        if AXUIElementCopyMultipleAttributeValues(element, attributes, [], &result) == .success,
+           let pair = result as? [CFTypeRef], pair.count == 2 {
+            values = pair
+        } else {
+            guard let position = copy(element, kAXPositionAttribute),
+                  let size = copy(element, kAXSizeAttribute) else { return nil }
+            values = [position, size]
+        }
+        let positionValue = values[0], sizeValue = values[1]
+        guard CFGetTypeID(positionValue) == AXValueGetTypeID(),
               CFGetTypeID(sizeValue) == AXValueGetTypeID()
         else { return nil }
 
@@ -125,8 +145,12 @@ final class WindowDriver {
         for attempt in 0..<2 {
             if canResize { setSize(element, target.size) }
             setPosition(element, target.origin)
-            if canResize { setSize(element, target.size) }
             if let actual = frame(of: element), Self.matches(actual, target) { return true }
+            // Moving to a larger display can lift the old display's size limit.
+            if canResize {
+                setSize(element, target.size)
+                if let actual = frame(of: element), Self.matches(actual, target) { return true }
+            }
             if attempt == 0 { usleep(40_000) }
         }
         if let actual = frame(of: element) {
@@ -172,20 +196,64 @@ final class WindowDriver {
         return AXWindow(element: element, key: key, bundleID: bundleID, appName: appName)
     }
 
+    private func windowElements(ofApp pid: pid_t) -> [AXUIElement] {
+        copy(appElement(pid), kAXWindowsAttribute) as? [AXUIElement] ?? []
+    }
+
     func windows(ofApp pid: pid_t) -> [AXWindow] {
         let running = NSRunningApplication(processIdentifier: pid)
         let bundleID = running?.bundleIdentifier
         let name = running?.localizedName ?? "Unknown"
-        guard let list = copy(appElement(pid), kAXWindowsAttribute) as? [AXUIElement] else { return [] }
-        return list.compactMap { makeHandle($0, pid: pid, bundleID: bundleID, appName: name) }
+        return windowElements(ofApp: pid).compactMap { makeHandle($0, pid: pid, bundleID: bundleID, appName: name) }
     }
 
     /// All standard windows of all regular apps, in the front-to-back order that
     /// `NSWorkspace` reports applications.
     func allWindows() -> [AXWindow] {
-        NSWorkspace.shared.runningApplications
+        if onlyOwnWindows { return windows(ofApp: getpid()) }
+        return NSWorkspace.shared.runningApplications
             .filter { $0.activationPolicy == .regular && !$0.isTerminated }
             .flatMap { windows(ofApp: $0.processIdentifier) }
+    }
+
+    /// WindowServer provides the current Space's front-to-back order and bounds
+    /// in one call. Use AX only for a window that could actually be involved.
+    func visibleWindows() -> [(window: VisibleWindow, frame: CGRect)] {
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                        kCGNullWindowID) as? [[String: Any]] else { return [] }
+        return windows.compactMap { info in
+            guard info[kCGWindowLayer as String] as? Int == 0,
+                  let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+                  let frame = CGRect(dictionaryRepresentation: bounds),
+                  let pid = info[kCGWindowOwnerPID as String] as? pid_t,
+                  !onlyOwnWindows || pid == getpid(),
+                  let number = info[kCGWindowNumber as String] as? CGWindowID else { return nil }
+            return (VisibleWindow(pid: pid, number: number), frame)
+        }
+    }
+
+    func visibleOccupants(of geometry: LayoutGeometry) -> [Slot: VisibleWindow] {
+        let boards = geometry.boards
+        var occupants: [Slot: VisibleWindow] = [:]
+        for (window, frame) in visibleWindows() {
+            if let (slot, _) = boards.first(where: { Self.matches(frame, $0.1, tolerance: 8) }),
+               occupants[slot] == nil { occupants[slot] = window }
+        }
+        return occupants
+    }
+
+    func resolve(_ visible: VisibleWindow, in rect: CGRect, excluding: AXWindow? = nil) -> AXWindow? {
+        let app = NSRunningApplication(processIdentifier: visible.pid)
+        for element in windowElements(ofApp: visible.pid) {
+            if let excluding, CFEqual(element, excluding.element) { continue }
+            if let number = windowID(element), number != visible.number { continue }
+            guard let frame = frame(of: element), Self.matches(frame, rect, tolerance: 8),
+                  let window = makeHandle(element, pid: visible.pid, bundleID: app?.bundleIdentifier,
+                                          appName: app?.localizedName ?? "Unknown"),
+                  !isMinimized(window) else { continue }
+            return window
+        }
+        return nil
     }
 
     func focusedWindow() -> AXWindow? {

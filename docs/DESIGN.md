@@ -15,7 +15,7 @@ sized to what the eye can monitor without turning the head. Each peripheral colu
 split into two near-square panes, producing a five-slot triptych: **C** (centre), **LT/LB**
 (left top/bottom), **RT/RB** (right top/bottom). Windows move between slots as a
 **permutation**: every move swaps two windows, so a board is never left empty and no window
-is ever lost. The centre board is a **stage** with a queue — one hotkey rotates the next
+is ever lost. The centre board is a **stage** with a queue — the stage menu rotates the next
 staged window in and sends the current one back to the slot it came from. Geometry is
 fixed by muscle memory; only roles change.
 
@@ -195,7 +195,7 @@ Five logical slots, always addressable, in two geometry modes:
 * **Triptych** (`sideSplit = false`): L = full column, R = full column. Three visible boards.
 * **Split** (`sideSplit = true`): L = LT over LB, R = RT over RB. Five visible boards.
 
-Slot names never change between modes, so hotkeys stay constant and muscle memory holds.
+Slot names never change between modes, so the same gesture works in both layouts.
 
 ### 3.2 Geometry rules
 
@@ -268,23 +268,18 @@ to (2617, 721, 742, 696) and back as the Dock went to the left edge and returned
    C, then each remaining board goes to the largest window *that remembers sitting
    there*, and only then does size decide. Arranging rebuilds the mapping rather than
    moving windows one at a time, so nothing is displaced by a cascade. Memory is per
-   display and per app: every successful placement — hotkey, hop, drag or arrange —
-   records `bundle id → board`, so a second Arrange reproduces the layout you left
-   instead of re-sorting by window size. `Forget app-to-board memory` in the menu
-   clears it.
+   display and per app. Each successful placement records the app’s board, so
+   Arrange can put it there again. `Forget app-to-board memory` clears these preferences.
 
 Everything else (arrangements, fill, centre-without-resize) is a convenience built from
 these.
 
 ### 4.2 Permutation semantics (the core rule)
 
-> **A move never evicts.** If the target slot is occupied, the occupant takes the mover's
-> old slot — including when the mover came from "nowhere" (floating), in which case the
-> occupant is swapped *into* the centre stage queue rather than being hidden.
-
-Why: eviction creates invisible windows, and invisible windows are how users lose work.
-A permutation is reversible with the same keystroke, which makes every action safe to
-try. Undo is just "do it again".
+When a window moves between two occupied boards, the windows trade places. Drag the
+same window back to restore the pair. If the incoming window was floating, Sightline
+tries to give the other window its previous frame. If the other window cannot fit,
+Sightline adds it to the display’s centre stage queue.
 
 ### 4.3 The centre stage
 
@@ -292,7 +287,7 @@ The centre board is a **stage with a queue**, not a Z-stack:
 
 ```
 stage = [ A, B, C, D ]        centre shows A
-⌃⌥`   →  centre shows B, A returns to B's previous slot (or queue tail)
+Next staged window →  centre shows B, A returns to B's previous slot (or queue tail)
 ```
 
 * Windows enter the stage when placed in C, or explicitly with **Stage Window**.
@@ -305,55 +300,32 @@ stage = [ A, B, C, D ]        centre shows A
 Rationale: the user asked for "switch windows to work on the main board easily"; a queue
 gives deterministic, repeatable rotation, unlike Z-order cycling which changes under you.
 
-### 4.4 Hotkeys (defaults)
+### 4.4 Swap with centre
 
-| Shortcut | Action |
-|---|---|
-| `⌃⌥1` | Place focused window in the centre board **C** |
-| `⌃⌥2` / `⌃⌥3` | Place in **LT** / **LB** (whole left column when the split is off) |
-| `⌃⌥4` / `⌃⌥5` | Place in **RT** / **RB** |
-| `⌃⌥⇧H` / `⌃⌥⇧L` | Hop the focused window one board left / right |
-| `⌃⌥⇧K` / `⌃⌥⇧J` | Hop up / down within a split column |
-| `` ⌃⌥` `` | Cycle the centre stage forward (`` ⌃⌥⇧` `` backward) |
-| `⌃⌥⇧T` | Send the focused window to the centre stage |
-| `⌃⌥⇧S` | Toggle the side split |
-| `⌃⌥[` / `⌃⌥]` | Previous / next layout preset |
-| `⌃⌥−` / `⌃⌥=` | Narrow / widen the centre board by 1 % |
-| `⌃⌥⇧R` | Arrange all windows on this display into the boards |
-| `⌃⌥⇧F` | Fill the screen |
-| `⌃⌥⇧C` | Centre the window at its current size |
-| `⌃⌥⇧A` / `⌃⌥⇧Z` | Save / restore the arrangement |
-| `⌃⌥,` | Open settings |
+Hold **Control + Command** and tap **←** or **→** to highlight an occupied pane on
+that side of the active display. In a split column, Sightline starts with the upper
+window if available. Tap **↑** or **↓** to choose a row. An empty side clears the
+highlight so you can choose the other side.
 
-**Why not arrows.** Rectangle — free, and installed on most Macs — already owns the obvious
-combinations: `⌃⌥←/→/↑/↓` for halves, `⌃⌥C`, `⌃⌥F`, and `⌃⌥D/E/G/T/U/I/J/K` for thirds and
-quarters. Carbon registers hotkeys first-come-first-served, and a registration that loses
-another app's claim returns no error: the key simply never arrives. A collision is
-invisible until someone presses the combination and nothing happens.
+Release either modifier to exchange the highlighted window with the centre window
+and give it keyboard focus. Repeating the gesture returns the original window to
+the centre. Window placement, layout and stage commands are available in the menu.
 
-We measured this rather than trusting the documentation. On macOS 15.8 a synthetic
-`⌃⌥⇧←` never reached Carbon at all, while `⌃⌥⇧T` did — control-arrow combinations are
-consumed before the hotkey layer, by the window server or Mission Control. That is why the
-hops are `⌃⌥⇧H/J/K/L` and not `⌃⌥⇧arrows`: the arrows do not survive the trip.
-
-The policy that follows: keep `⌃⌥` for the digits and a few rare keys (presets, stage
-cycling, settings), put everything else behind `⌃⌥⇧`, and accept that another app may
-still own a combination. We log the `OSStatus` when Carbon refuses a registration
-outright, but a lost race to another app is silent, so **drag-to-snap (M4) is the escape
-hatch**: if a key is taken, the user drags instead of rebinding, and drag-to-snap does not
-depend on Carbon at all.
+<picture>
+  <source media="(prefers-reduced-motion: reduce)" srcset="assets/keyboard-centre-swap-still.png">
+  <img src="assets/keyboard-centre-swap.gif" alt="With Control and Command held, Right highlights the upper-right pane and Down selects the terminal below it. Releasing either modifier swaps the terminal with the centre editor. Repeating the gesture brings the editor back." width="1040">
+</picture>
 
 ### 4.5 Drag-to-snap (shipped)
 
-Dragging is a second way into the same board model, and it follows the model: any window
-can be dragged onto a board with no modifier at all. An overlay dims the screen, outlines
-the five boards and fills the one under the pointer; release takes that board, with the
-same permutation rule as the shortcuts (no eviction, occupants swap).
+Drag a window by its title bar to move it onto a board. Sightline outlines the three
+or five boards and highlights the one under the pointer. On release, the window
+snaps to fit. When you drag between two occupied boards, the windows trade places.
 
 - **A plain drag is a board move.** That includes a window the app has never tracked — a
   window you just created, or one another app placed — which is the case users report
   first: "I opened a new window, dragged it to the side, and nothing happened." Tracking
-  is only how the *source* board is found; it is not a precondition for snapping.
+  is optional because the window's frame at mouse-down identifies its source board.
 - **A drag that starts and ends on the same board is a free move.** The window stays where
   it was put, so it can be nudged inside its board without the layout pulling it back.
   Text selection and content drags never move the window frame, so they never arm the
@@ -373,17 +345,18 @@ same permutation rule as the shortcuts (no eviction, occupants swap).
 - **Travel threshold 26 pt**, so clicks, double-clicks and text selection never draw the
   overlay; release slack is 16 pt around the window's own frame, which keeps a title-bar
   drag inside its own window.
-- **The target is resolved on release** via `AXFocusedWindow`, falling back to the
-  frontmost window containing the release point when focus has not followed the drag (an
-  inactive window, an app slow to activate). Hit-testing uses the slot rectangles, so the
-  preview is always exactly what a hotkey would produce, on any display shape.
+- **On release**, Sightline uses the window captured at mouse-down if it still contains
+  the pointer. Otherwise it checks the frontmost window at the release point. A single
+  WindowServer snapshot narrows the search for the destination's occupant to visible
+  candidates. On a global mouse-up, Sightline fits the dragged window immediately,
+  then moves the previous occupant. A local mouse-up waits for AppKit's tracking loop
+  to finish so it cannot overwrite the final frame.
 
 ### 4.6 Arrangements
 
-`Save Arrangement` records, per display: slot → (bundle id, window title, slot, stage
-index). `Restore` enumerates live windows, matches by bundle id then title similarity,
-places them, and reports unmatched entries instead of silently failing. This is the
-"come back to work tomorrow" feature: one keystroke rebuilds the triptych.
+**Arrangements → Save arrangement** records the display, board, app and title of each
+tracked window. When those windows are open again, **Restore arrangement** places
+the windows it can match and reports how many it restored.
 
 ### 4.7 Quick menu (shipped)
 
@@ -452,7 +425,7 @@ always resolves to the newest release's asset by name.
 right click opens Settings.
 
 **Menu** — Presets ▸, Side split ✓, Stage ▸ (Cycle, Show queue), Arrangements ▸, Settings…,
-Permissions…, About, Quit. No window list: the app is keyboard-first.
+Permissions…, About, Quit.
 
 **Settings window** (SwiftUI, 720 × 560):
 
@@ -472,7 +445,7 @@ Permissions…, About, Quit. No window list: the app is keyboard-first.
 │  Visual half-angle  21.4°  ✓ inside comfort cone (≤22°)      │
 │  Side pane  756 × 667 pt · 1.14 : 1                          │
 │  ☑ Split side boards      Viewing distance  [65 cm ▾]        │
-│  Hotkeys …                                                   │
+│  Swap with centre                                                   │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -480,8 +453,8 @@ The diagram uses the display's **true aspect ratio**, so the proportions on scre
 the proportions on the desk. Degree ticks are drawn as arcs from the assumed eye point.
 
 **Onboarding** — a single panel: what the app does, a live preview of the triptych, the
-Accessibility permission button, and a 5-line hotkey cheat sheet. Permission state is
-re-checked on activation, never polled.
+Accessibility permission button, and a description of the centre swap. Permission state is
+refreshed while the settings window is visible and when the menu opens.
 
 ---
 
@@ -489,7 +462,7 @@ re-checked on activation, never polled.
 
 ```
                     ┌──────────────────────┐
-   Carbon hotkey ──▶│   HotKeyCenter        │
+   Ctrl+Cmd+arrows ─▶│ CentreSwapKeyboard   │
                     └──────────┬───────────┘
                                ▼
    menu / settings ──▶┌──────────────────────┐      ┌──────────────────┐
@@ -512,8 +485,8 @@ re-checked on activation, never polled.
 | `SnapController` | implement the commands, permutation logic | main-actor |
 | `StageStore` | centre queue, window→slot memory | in-memory + JSON persistence |
 | `DisplayRegistry` | NSScreen ↔ display UUID ↔ layout | handles hot-plug |
-| `Preferences` | ratios, gaps, hotkeys, distance | `Codable` → UserDefaults |
-| `HotKeyCenter` | global hotkeys | Carbon, no deps |
+| `Preferences` | ratios, gaps, viewing distance | `Codable` → UserDefaults |
+| `CentreSwapKeyboard` | pane selection and modifier release | Quartz event tap on a private run loop |
 | `SettingsView` / `OnboardingView` | SwiftUI UI | preview shared with LayoutEngine |
 
 **Threading.** Everything that touches AX or AppKit runs on the main actor. Hot-key events
@@ -523,9 +496,9 @@ enumerated on demand (one call per action) to keep the CPU profile at zero when 
 **Persistence.** `~/Library/Application Support/Sightline/state.json` — preferences,
 per-display layouts, arrangements, stage hints. Atomic writes.
 
-**Failure handling.** Every AX write is best-effort: read back the frame, and if it did not
-stick, retry once after 30 ms (some apps settle asynchronously), then surface a one-line
-HUD "This window refused to resize." Never crash, never block the hotkey.
+**Failure handling.** Sightline reads back the frame after moving and resizing a
+window. If the app takes time to apply it, Sightline waits 40 ms and retries once.
+If the window still cannot fit, a brief on-screen message names the app.
 
 ---
 
@@ -601,10 +574,10 @@ grant across rebuilds. Ad-hoc signing would re-prompt on every build.
 |---|---|---|
 | Some app ignores AX resize | Medium | Retry + read-back + explicit HUD; documented list |
 | macOS changes AX behaviour | Low | All AX behind one module; easy to patch |
-| Hotkey collisions with Rectangle/Magnet | High | Carbon cannot see another app's claim and a lost registration is silent: document the conflict set, keep `⌃⌥` for rare keys, allow rebinding, and offer drag-to-snap (M4) as the escape hatch |
+| Shortcut conflicts with other apps | Medium | Only Ctrl+Cmd+Left and Ctrl+Cmd+Right start the gesture. Up and Down are handled during selection. Dragging also swaps windows. |
 | Users on 27″ or laptop find 55 % too wide/narrow | Medium | Ratio is per-display and degree-aware; presets cover 44–66 % |
 | TCC grant lost after reinstall | Low | Stable signature; onboarding re-prompt is one click |
-| Drag-to-snap instability | Medium | Implemented after the keyboard path was complete; other windows' drags observed via NSEvent monitors, moves deferred out of the drag loop, and the keyboard path remains the fallback. A plain drag only acts once the window itself has moved and ends on a board; a drag inside its own board, text selection and content drags are left alone, so ordinary free dragging still works |
+| Drag-to-snap instability | Medium | Sightline checks that the window moved before showing a board preview. It snaps another app’s window on mouse-up. For a local drag, it waits until AppKit finishes tracking the window. |
 
 ---
 
@@ -613,7 +586,7 @@ grant across rebuilds. Ad-hoc signing would re-prompt on every build.
 | Milestone | Content | Status |
 |---|---|---|
 | **M0** | This design, attention math, layout diagrams | done |
-| **M1** | Menu-bar app, layout engine, 5 slots, place/hop/promote, hotkeys, permission flow | this build |
+| **M1** | Menu-bar app, layout engine, five slots, placement commands, keyboard centre swap and permission flow | this build |
 | **M2** | Stage queue + rotation, arrangements save/restore | this build |
 | **M3** | Settings window with live attention preview | this build |
 | **M4** | Drag-to-snap with preview overlay | shipped |
@@ -627,11 +600,11 @@ grant across rebuilds. Ad-hoc signing would re-prompt on every build.
 | Decision | Alternatives | Why |
 |---|---|---|
 | Native Swift + AppKit | Electron, Python | AX control, global hotkeys and menu-bar lifecycle are native-only in practice; a resident utility must be small and dependency-free |
-| Carbon `RegisterEventHotKey` | `CGEventTap`, `NSEvent` global monitor | Hotkeys work without extra permissions and survive app deactivation; `NSEvent` global monitors require Accessibility and miss some keys. Carbon also cannot see another app's claim, so collisions are silent — hence the namespace split in §4.4 |
+| Quartz session event tap | Carbon hotkey registration | A gesture needs both arrow events and modifier releases. The tap consumes the selected arrows and forwards ordinary input. |
 | Centre 55 % default | Equal thirds, 60 % | 55 % sits inside the 49.6–56.5 % band at 65 cm and its side panes split into 756 × 667 pt near-square tiles; 60 % already breaks the 22° cap |
 | Permutation semantics | Evict overflow to centre/edges | Eviction hides windows; permutation is reversible and keeps every board occupied |
 | Stage queue | Z-order cycling | Deterministic and repeatable; Z-order changes under the user's feet |
-| Five logical slots in two geometry modes | Separate 3-slot and 5-slot layouts | Hotkeys and window→slot memory stay valid when toggling the split |
+| Five logical slots in two geometry modes | Separate 3-slot and 5-slot layouts | Menu actions, keyboard selection and remembered boards work with either side layout. |
 | Single top-left coordinate space | Mixed AppKit/AX spaces | Eliminates multi-display sign errors |
 | SwiftPM + hand-assembled bundle | Xcode project | Buildable from CLI, reviewable `.pbxproj`-free, reproducible |
 | Quick menu | `⌥`-right-click anywhere plus a plain right-click on bare desktop wallpaper, active event tap on a private run loop | Finder offers no way to extend the desktop context menu and Arrange needs to be one click away; the takeover is scoped by a window-list + AX-role test at the pointer, and carries New Folder and Change Wallpaper so nothing is lost. The tap cannot live on the main run loop because a menu blocks it, and one unconsumed mouse-up strands the swallow flag |

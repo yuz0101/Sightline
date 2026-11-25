@@ -38,7 +38,13 @@ final class Preferences {
     }
 
     private(set) var store = Store()
+    private let persistent: Bool
     private var loaded = false
+
+    init(persistent: Bool = true) {
+        self.persistent = persistent
+    }
+
     var onChange: ((_ changedDisplay: String?) -> Void)?
 
     private var fileURL: URL {
@@ -56,7 +62,7 @@ final class Preferences {
     }
 
     func load() {
-        guard !loaded else { return }
+        guard persistent, !loaded else { return }
         loaded = true
         var data = try? Data(contentsOf: fileURL)
         if data == nil, let legacy = try? Data(contentsOf: legacyFileURL) {
@@ -82,6 +88,7 @@ final class Preferences {
     }
 
     func save() {
+        guard persistent else { return }
         let dir = fileURL.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let enc = JSONEncoder()

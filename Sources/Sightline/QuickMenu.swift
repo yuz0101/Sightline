@@ -17,7 +17,7 @@ import CoreGraphics
 @MainActor
 final class QuickMenu {
     private let prefs: Preferences
-    private let perform: (HotKeyAction) -> Void
+    private let perform: (MenuAction) -> Void
 
     private var state: TapState?
     private var thread: Thread?
@@ -33,7 +33,7 @@ final class QuickMenu {
 
     var log: ((String) -> Void)?
 
-    init(prefs: Preferences, perform: @escaping (HotKeyAction) -> Void) {
+    init(prefs: Preferences, perform: @escaping (MenuAction) -> Void) {
         self.prefs = prefs
         self.perform = perform
     }
@@ -185,7 +185,7 @@ final class QuickMenu {
         menu.addItem(.separator())
 
         let place = NSMenu()
-        for action in [HotKeyAction.placeCenter, .placeLeftTop, .placeLeftBottom,
+        for action in [MenuAction.placeCenter, .placeLeftTop, .placeLeftBottom,
                        .placeRightTop, .placeRightBottom] {
             place.addItem(actionItem(action))
         }
@@ -204,7 +204,6 @@ final class QuickMenu {
                                        action: #selector(newDesktopFolder),
                                        keyEquivalent: "")
             newFolder.target = self
-            newFolder.attributedTitle = labelled("New Folder", hint: "\u{2318}\u{21e7}N")
             menu.addItem(newFolder)
             let wallpaper = NSMenuItem(title: "Change Wallpaper\u{2026}",
                                        action: #selector(changeWallpaper),
@@ -221,27 +220,11 @@ final class QuickMenu {
         return menu
     }
 
-    private func actionItem(_ action: HotKeyAction) -> NSMenuItem {
+    private func actionItem(_ action: MenuAction) -> NSMenuItem {
         let item = NSMenuItem(title: action.title, action: #selector(pick(_:)), keyEquivalent: "")
         item.target = self
         item.representedObject = NSNumber(value: action.rawValue)
-        item.attributedTitle = labelled(action.title, hint: action.shortcut)
         return item
-    }
-
-    private func labelled(_ text: String, hint: String) -> NSAttributedString {
-        let style = NSMutableParagraphStyle()
-        style.tabStops = [NSTextTab(textAlignment: .right, location: 236)]
-        let out = NSMutableAttributedString(string: text + "\t", attributes: [
-            .font: NSFont.menuFont(ofSize: 0),
-            .paragraphStyle: style,
-        ])
-        out.append(NSAttributedString(string: hint, attributes: [
-            .font: NSFont.menuFont(ofSize: 0),
-            .foregroundColor: NSColor.secondaryLabelColor,
-            .paragraphStyle: style,
-        ]))
-        return out
     }
 
     @objc private func newDesktopFolder() {
@@ -269,7 +252,7 @@ final class QuickMenu {
 
     @objc private func pick(_ sender: NSMenuItem) {
         guard let number = sender.representedObject as? NSNumber,
-              let action = HotKeyAction(rawValue: number.uint32Value) else { return }
+              let action = MenuAction(rawValue: number.uint32Value) else { return }
         log?("quick menu: \(action.title)")
         perform(action)
     }

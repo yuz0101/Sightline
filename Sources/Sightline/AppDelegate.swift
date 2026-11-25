@@ -1,24 +1,24 @@
 import AppKit
+import Carbon.HIToolbox
 import Sparkle
 import SightlineCore
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private let prefs = Preferences.shared
+    private static let selfTesting = ProcessInfo.processInfo.environment["SIGHTLINE_SELFTEST"] != nil
+    private let prefs = AppDelegate.selfTesting || ProcessInfo.processInfo.environment["SIGHTLINE_SNAPSHOT"] != nil
+        ? Preferences(persistent: false) : Preferences.shared
     private var displays: DisplayRegistry!
     private var driver: WindowDriver!
     private var snaps: SnapController!
-    private var hotKeys: HotKeyCenter!
+    private var swapKeyboard: CentreSwapKeyboard!
     private var hud: HUD!
     private var dragSnap: DragSnap!
     private var quickMenu: QuickMenu!
     private var settings: SettingsWindowController!
     private var statusItem: NSStatusItem?
     /// Owns the update check, the appcast fetch and the install/relaunch cycle.
-    private var updater: SPUStandardUpdaterController!
-    /// Windows that were on screen when the self-test started, and where they were.
-    private var selfTestBystanders: [(window: AXWindow, frame: CGRect)] = []
-
+    private var updater: SPUStandardUpdaterController?
     /// Watches the usable area so a Dock that moves or resizes is followed.
     private var usableWatch: Timer?
     private var usableDebounce: Timer?
@@ -29,7 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         prefs.load()
         displays = DisplayRegistry(prefs: prefs)
-        driver = WindowDriver()
+        driver = WindowDriver(onlyOwnWindows: Self.selfTesting)
         snaps = SnapController(driver: driver, displays: displays, prefs: prefs)
         hud = HUD()
         dragSnap = DragSnap(driver: driver, displays: displays, snaps: snaps, prefs: prefs)
@@ -41,13 +41,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             dragSnap.log = { [weak self] line in self?.log(line) }
             quickMenu.log = { [weak self] line in self?.log(line) }
         }
-        updater = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        if Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") != nil {
+            updater = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        }
         // Test hook: an explicit check on launch, so the update path can be
         // exercised without hunting for the menu item.
         if ProcessInfo.processInfo.environment["SIGHTLINE_CHECK_UPDATES"] == "1" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
                 self?.log("updates: explicit check")
-                self?.updater.checkForUpdates(nil)
+                self?.updater?.checkForUpdates(nil)
             }
         }
         settings = SettingsWindowController(prefs: prefs, displays: displays) { [weak self] in
@@ -65,9 +67,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildMainMenu()
         installStatusItem()
 
-        hotKeys = HotKeyCenter()
-        hotKeys.onAction = { [weak self] action in self?.handle(action) }
-        hotKeys.install()
+        swapKeyboard = CentreSwapKeyboard { [weak self] update in
+            self?.snaps.handleCentreSwap(update)
+        }
+        swapKeyboard.installIfNeeded()
         if prefs.dragSnapEnabled { dragSnap.install() }
         if prefs.quickMenuEnabled { quickMenu.install() }
 
@@ -87,7 +90,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        if !Accessibility.isTrusted {
+        if Self.selfTesting && !Accessibility.isTrusted {
+            log("selftest: Accessibility permission is required for global gesture delivery")
+            exit(2)
+        }
+        if !Accessibility.isTrusted && ProcessInfo.processInfo.environment["SIGHTLINE_SNAPSHOT"] == nil {
             Accessibility.requestPrompt()
         }
         let environment = ProcessInfo.processInfo.environment
@@ -97,13 +104,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             settings.show()
         }
 
-        settings.setUnavailableShortcuts(hotKeys.failures)
-
         if environment["SIGHTLINE_VERBOSE"] != nil {
             let trust = Accessibility.isTrusted ? "trusted" : "NOT trusted"
             FileHandle.standardError.write(Data("Sightline: accessibility \(trust)\n".utf8))
-            let failed = hotKeys.failures.map { "\($0.shortcut) \($0.title)" }
-            FileHandle.standardError.write(Data("Sightline: hotkeys failed=\(failed)\n".utf8))
             for screen in displays.screens {
                 let layout = prefs.layout(for: screen.id)
                 let geo = screen.geometry(layout)
@@ -137,21 +140,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         FileHandle.standardError.write(Data((line + "\n").utf8))
     }
 
-    private func postHotKey(virtualKey: CGKeyCode,
-                            flags: CGEventFlags = [.maskControl, .maskAlternate]) {
-        guard let source = CGEventSource(stateID: .hidSystemState),
-              let down = CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: true),
-              let up = CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: false)
-        else { return }
-        down.flags = flags
-        up.flags = flags
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
+    private func postSwapArrow(_ key: Int) {
+        for down in [true, false] {
+            let event = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(key), keyDown: down)
+            event?.flags = [.maskControl, .maskCommand]
+            event?.post(tap: .cghidEventTap)
+        }
+    }
+
+    private func releaseSwapChord() {
+        let release = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(kVK_Command), keyDown: false)
+        release?.type = .flagsChanged
+        release?.flags = []
+        release?.post(tap: .cghidEventTap)
     }
 
     private func runSelfTest() {
         guard let screen = displays.primary else {
-            log("selftest: no display"); self.finishSelfTest(2)
+            log("selftest: no display"); exit(2)
         }
         let geo = screen.geometry(prefs.layout(for: screen.id))
 
@@ -162,17 +168,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let a = driver.windows(ofApp: getpid()).first(where: { $0.key.title == "Self Test A" }),
               let b = driver.windows(ofApp: getpid()).first(where: { $0.key.title == "Self Test B" })
         else {
-            log("selftest: scratch windows missing from AX"); self.finishSelfTest(3)
+            log("selftest: scratch windows missing from AX"); exit(3)
         }
-        _ = windowB
-
-        // The test drives real boards, and the permutation rule can push a real
-        // window out of the way to make room. Remember where everything was and put
-        // it back, so running the self-test never rearranges the user's desktop.
-        selfTestBystanders = driver.allWindows()
-            .filter { $0.key.pid != getpid() }
-            .compactMap { window in driver.frame(of: window.element).map { (window, $0) } }
-
         var failures = 0
 
         for slot in Slot.allCases {
@@ -186,7 +183,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Permutation: B takes the centre from A, and A lands in B's old slot.
         guard let leftTop = geo.rect(for: .leftTop), let center = geo.rect(for: .center) else {
-            log("selftest: geometry missing"); self.finishSelfTest(4)
+            log("selftest: geometry missing"); exit(4)
         }
         _ = snaps.perform(window: a, slot: .center, screen: screen)
         _ = snaps.perform(window: b, slot: .leftTop, screen: screen)
@@ -198,35 +195,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !swapOK { failures += 1 }
         log("selftest swap a=\(aFrame.integral) b=\(bFrame.integral) \(swapOK ? "PASS" : "FAIL")")
 
-        // Hotkey: A is put on the left pane and made key, then ⌃⌥1 should bring
-        // the focused window — A — to the centre board.
-        _ = driver.setFrame(leftTop, of: a.element)
-        NSApp.activate(ignoringOtherApps: true)
-        windowA.makeKeyAndOrderFront(nil)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            self.postHotKey(virtualKey: 18)  // kVK_ANSI_1 — "place in the centre board"
+        // Select the lower-right pane, verify the preview left both windows
+        // in place, then release. Repeating must swap the original pair back.
+        let right = geo.rect(for: .rightBottom)!
+        _ = snaps.perform(window: a, slot: .rightBottom, screen: screen)
+        windowB.makeKeyAndOrderFront(nil)
+        func matches(_ window: AXWindow, _ rect: CGRect) -> Bool {
+            guard let frame = driver.frame(of: window.element) else { return false }
+            return WindowDriver.matches(frame, rect, tolerance: 2)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
-            guard let self else { exit(5) }
-            let actual = self.driver.frame(of: a.element) ?? .zero
-            let ok = WindowDriver.matches(actual, center, tolerance: 2)
+        func pickRight() {
+            postSwapArrow(kVK_RightArrow)
+            postSwapArrow(kVK_DownArrow)
+        }
+        pickRight()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            if !matches(a, right) || !matches(b, center) { failures += 1 }
+            self.releaseSwapChord()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
+            let ok = matches(a, center) && matches(b, right) && self.driver.focusedWindow()?.key == a.key
             if !ok { failures += 1 }
-            self.log("selftest hotkey ⌃⌥1 got=\(actual.integral) want=\(center.integral) \(ok ? "PASS" : "FAIL")")
-
-            // Hop: from the centre, ⌃⌥← should land in the left column. This also
-            // proves the arrow shortcuts win over any other app that uses them.
-            windowA.makeKeyAndOrderFront(nil)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                self.postHotKey(virtualKey: 4,
-                                flags: [.maskControl, .maskAlternate, .maskShift])  // ⌃⌥⇧H
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                guard let self else { exit(6) }
-                let frame = self.driver.frame(of: a.element) ?? .zero
-                let expected = [geo.rect(for: .leftTop), geo.rect(for: .leftBottom)].compactMap { $0 }
-                let hopOK = expected.contains { WindowDriver.matches(frame, $0, tolerance: 2) }
-                if !hopOK { failures += 1 }
-                self.log("selftest hop ⌃⌥⇧H got=\(frame.integral) \(hopOK ? "PASS" : "FAIL")")
+            self.log("selftest centre swap and focus \(ok ? "PASS" : "FAIL")")
+            pickRight()
+            self.releaseSwapChord()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+                let back = matches(a, right) && matches(b, center)
+                if !back { failures += 1 }
+                self.log("selftest repeat swap \(back ? "PASS" : "FAIL")")
+                _ = self.snaps.perform(window: a, slot: .leftTop, screen: screen)
 
                 // Drag: ⌥-drag A from the left column onto the right column's lower
                 // pane. AppKit's own window-drag tracking loop reads events directly
@@ -279,22 +276,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         self.dragSnap.allowsOwnWindows = false
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                             self.log("selftest: \(failures == 0 ? "ALL PASS" : "\(failures) FAILURE(S)")")
-                            self.prefs.save()
-                            self.finishSelfTest(failures == 0 ? 0 : 1)
+                            exit(failures == 0 ? 0 : 1)
                         }
                     }
                 }
             }
         }
-    }
-
-    /// Restore the user's windows, then exit. `exit()` skips `defer`, and the test
-    /// ends inside async closures, so every exit point goes through here.
-    private func finishSelfTest(_ code: Int32) -> Never {
-        for (window, frame) in selfTestBystanders {
-            _ = driver.setFrame(frame, of: window.element)
-        }
-        exit(code)
     }
 
     private func scratchWindow(title: String) -> NSWindow {
@@ -312,7 +299,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func captureSnapshot(to path: String) {
-        guard let window = NSApp.windows.first(where: { $0.title == "Sightline" }),
+        guard let window = NSApp.windows.first(where: { $0.title == Accessibility.appName }),
               let view = window.contentView else {
             FileHandle.standardError.write(Data("snapshot: window not found\n".utf8))
             NSApp.terminate(nil)
@@ -351,7 +338,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         prefs.save()
-        hotKeys?.uninstall()
+        swapKeyboard?.uninstall()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -395,6 +382,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func checkUsableArea() {
+        settings.refreshVisiblePermissionStatus()
+        swapKeyboard.installIfNeeded()
         guard displays.liveSignature != lastUsableSignature else { return }
         scheduleUsableAreaCheck()
     }
@@ -422,8 +411,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.reload()
     }
 
-    private func handle(_ action: HotKeyAction) {
-        log("hotkey: \(action)")
+    private func handle(_ action: MenuAction) {
+        log("menu: \(action)")
         if action != .openSettings && !Accessibility.isTrusted {
             Accessibility.requestPrompt()
             settings.show()
@@ -443,9 +432,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .cycleForward: snaps.cycleStage()
         case .cycleBackward: snaps.cycleStage(backwards: true)
         case .stageFocused: snaps.stageFocusedWindow()
-        case .toggleSplit: snaps.toggleSplit()
-        case .presetPrevious: snaps.stepPreset(-1)
-        case .presetNext: snaps.stepPreset(1)
         case .nudgeNarrower: snaps.nudgeCenter(-1)
         case .nudgeWider: snaps.nudgeCenter(1)
         case .fillScreen: snaps.fillScreen()
@@ -465,8 +451,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "About Sightline", action: #selector(showAbout), keyEquivalent: "")
             .target = self
-        appMenu.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
-            .target = self
+        if updater != nil {
+            appMenu.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+                .target = self
+        }
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
             .target = self
@@ -547,13 +535,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         let place = NSMenu()
-        for action in [HotKeyAction.placeCenter, .placeLeftTop, .placeLeftBottom, .placeRightTop, .placeRightBottom] {
+        for action in [MenuAction.placeCenter, .placeLeftTop, .placeLeftBottom, .placeRightTop, .placeRightBottom] {
             place.addItem(actionItem(action))
         }
         menu.addItem(submenuItem("Place window", place))
 
         let move = NSMenu()
-        for action in [HotKeyAction.hopLeft, .hopRight, .hopUp, .hopDown] {
+        for action in [MenuAction.hopLeft, .hopRight, .hopUp, .hopDown] {
             move.addItem(actionItem(action))
         }
         menu.addItem(submenuItem("Move window", move))
@@ -617,9 +605,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(submenuItem("Arrangements", arrangement))
 
         menu.addItem(.separator())
-        let updatesItem = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
-        updatesItem.target = self
-        menu.addItem(updatesItem)
+        if updater != nil {
+            let updatesItem = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+            updatesItem.target = self
+            menu.addItem(updatesItem)
+        }
 
         let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: "")
         settingsItem.target = self
@@ -636,11 +626,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return prefs.layout(for: screen.id)
     }
 
-    private func actionItem(_ action: HotKeyAction) -> NSMenuItem {
+    private func actionItem(_ action: MenuAction) -> NSMenuItem {
         let item = NSMenuItem(title: action.title, action: #selector(runAction(_:)), keyEquivalent: "")
         item.target = self
         item.tag = Int(action.rawValue)
-        item.attributedTitle = attributedTitle(action.title, shortcut: action.shortcut)
         return item
     }
 
@@ -650,30 +639,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
-    private func attributedTitle(_ title: String, shortcut: String) -> NSAttributedString {
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.tabStops = [NSTextTab(textAlignment: .right, location: 268)]
-        let font = NSFont.menuFont(ofSize: 0)
-        let result = NSMutableAttributedString(
-            string: title,
-            attributes: [.font: font, .paragraphStyle: paragraph]
-        )
-        guard !shortcut.isEmpty else { return result }
-        result.append(NSAttributedString(
-            string: "\t\(shortcut)",
-            attributes: [
-                .font: font,
-                .foregroundColor: NSColor.secondaryLabelColor,
-                .paragraphStyle: paragraph,
-            ]
-        ))
-        return result
-    }
-
     // MARK: - Menu actions
 
     @objc private func runAction(_ sender: NSMenuItem) {
-        guard let action = HotKeyAction(rawValue: UInt32(sender.tag)) else { return }
+        guard let action = MenuAction(rawValue: UInt32(sender.tag)) else { return }
         handle(action)
     }
 
@@ -714,7 +683,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func checkForUpdates() {
-        updater.checkForUpdates(nil)
+        updater?.checkForUpdates(nil)
     }
 
     @objc private func openSettings() {

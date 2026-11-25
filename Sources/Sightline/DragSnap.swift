@@ -2,16 +2,8 @@ import AppKit
 import ApplicationServices
 import SightlineCore
 
-/// Drag-to-snap (design milestone M4).
-///
-/// Hold ⌥ while dragging a window: the five boards light up under a translucent
-/// overlay and the one under the pointer is where the window lands on release.
-///
-/// This deliberately does not go through Carbon. A shortcut can be silently owned
-/// by another app and there is no API to find out — but the mouse always works.
-///
-/// It also stays out of the way of macOS's own edge tiling: nothing happens unless
-/// ⌥ is held, so a plain drag to a screen edge still does whatever it did before.
+/// A window dragged across a board boundary snaps on release. Option also
+/// allows snapping back into the board where the drag began.
 @MainActor
 final class DragSnap {
     private enum Constants {
@@ -31,7 +23,7 @@ final class DragSnap {
 
     private var globalMonitor: Any?
     private var localMonitor: Any?
-    private let overlay = DragOverlay()
+    private let overlay = BoardOverlay()
 
     private var startPoint: CGPoint?
     /// Resolved on mouse-down, while the window is still sitting on its board:
@@ -71,13 +63,13 @@ final class DragSnap {
         globalMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]
         ) { [weak self] event in
-            MainActor.assumeIsolated { self?.handle(event) }
+            MainActor.assumeIsolated { self?.handle(event, local: false) }
         }
         // Global monitors never see this app's own windows; the local one does.
         localMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]
         ) { [weak self] event in
-            MainActor.assumeIsolated { self?.handle(event) }
+            MainActor.assumeIsolated { self?.handle(event, local: true) }
             return event
         }
     }
@@ -92,25 +84,25 @@ final class DragSnap {
 
     // MARK: - Event handling
 
-    private func handle(_ event: NSEvent) {
+    private func handle(_ event: NSEvent, local: Bool) {
         guard prefs.dragSnapEnabled else { return }
         switch event.type {
         case .leftMouseDown:
-            startPoint = pointer()
+            startPoint = pointer(for: event)
             pressed = nil
             if let point = startPoint, let screen = displays.screen(at: point),
-               let window = windowAtPress(point),
+               let window = windowUnderPointer(at: point),
                let frame = driver.frame(of: window.element) {
-                let slot = snaps.trackedSlot(for: window, on: screen)
+                let slot = boards(for: screen).first { WindowDriver.matches(frame, $0.1, tolerance: 8) }?.0
                 pressed = (window, slot, frame)
                 log?("press: \(window.displayName) is \(slot.map { "on \($0.label)" } ?? "floating")")
             }
             session = nil
             log?("drag: down")
         case .leftMouseDragged:
-            drag(to: pointer(), modifiers: event.modifierFlags)
+            drag(to: pointer(for: event), modifiers: event.modifierFlags)
         case .leftMouseUp:
-            finish(at: pointer(), modifiers: event.modifierFlags)
+            finish(at: pointer(for: event), afterLocalTracking: local)
         default:
             break
         }
@@ -132,6 +124,7 @@ final class DragSnap {
         }
         guard let screen = displays.screen(at: point) else { return }
 
+        let previous = session
         if session == nil {
             let boards = boards(for: screen)
             let forcing = modifiers.contains(Constants.modifier)
@@ -156,23 +149,19 @@ final class DragSnap {
                               source: sourceBoard(for: screen, boards: boards), forced: forced)
         }
         guard var current = session, let slot = slot(at: point, screen: screen, boards: current.boards) else { return }
+        if previous?.screen.id == screen.id, previous?.slot == slot { return }
         current.slot = slot
         session = current
         overlay.show(screen: screen, boards: current.boards, highlight: slot)
     }
 
-    private func finish(at point: CGPoint, modifiers: NSEvent.ModifierFlags) {
-        let hadSession = session != nil
+    private func finish(at point: CGPoint, afterLocalTracking: Bool) {
         defer { reset() }
-        guard let session else {
-            if hadSession { log?("drag: no session at release") }
-            return
-        }
+        guard let session else { return }
         guard let slot = slot(at: point, screen: session.screen, boards: session.boards) else {
             log?("drag: no board at \(point)")
             return
         }
-        overlay.hide()
 
         // A drag that begins and ends on the same board leaves the window floating:
         // that is how a window is nudged inside its board without the layout pulling
@@ -182,10 +171,19 @@ final class DragSnap {
             return
         }
 
-        // Resolve at release time: the window under the pointer is the one the user
-        // just dragged, whatever the focus dance was during the drag.
-        guard let window = windowUnderPointer(at: point) else { return }
-        commit(window: window, slot: slot, screen: session.screen, swapFrom: session.source)
+        // Reuse the exact window captured on press. Focus can change during
+        // a native drag, and querying another app here delays the resize.
+        let window: AXWindow
+        if let pressed, let frame = driver.frame(of: pressed.window.element),
+           frame.insetBy(dx: -Constants.releaseSlack, dy: -Constants.releaseSlack).contains(point) {
+            window = pressed.window
+        } else if let hit = windowUnderPointer(at: point) {
+            window = hit
+        } else {
+            return
+        }
+        commit(window: window, slot: slot, screen: session.screen,
+               swapFrom: session.source, afterLocalTracking: afterLocalTracking)
     }
 
     /// Test hook: drive the pipeline without synthesising mouse events.
@@ -196,7 +194,7 @@ final class DragSnap {
         guard let slot = slot(at: end, screen: screen, boards: boards) else { return }
         overlay.show(screen: screen, boards: boards, highlight: slot)
         commit(window: window, slot: slot, screen: screen,
-               swapFrom: sourceBoard(for: window, screen: screen, boards: boards))
+               swapFrom: sourceBoard(for: window, screen: screen, boards: boards), afterLocalTracking: true)
     }
 
     /// The board a window starts on, judged by how much of it overlaps each board.
@@ -233,68 +231,34 @@ final class DragSnap {
         return dx + dy + dw + dh >= 8
     }
 
-    /// The window the drag is about to start on, resolved while it is still in
-    /// place. Focus is tried first (cheap, and right for an active window); if it
-    /// does not contain the press point — focus can still sit on the previously
-    /// active window when the click is routed — the frontmost window under the
-    /// pointer wins. Stays quiet: this runs on every mouse-down.
-    private func windowAtPress(_ point: CGPoint) -> AXWindow? {
-        let slack = Constants.releaseSlack
-        if let focused = driver.focusedWindow(),
-           allowsOwnWindows || focused.key.pid != getpid(),
-           let frame = driver.frame(of: focused.element),
-           frame.insetBy(dx: -slack, dy: -slack).contains(point) {
-            return focused
-        }
-        for window in driver.allWindows() where allowsOwnWindows || window.key.pid != getpid() {
-            guard let frame = driver.frame(of: window.element),
-                  frame.insetBy(dx: -slack, dy: -slack).contains(point) else { continue }
-            return window
-        }
-        return nil
-    }
-
     private func windowUnderPointer(at point: CGPoint) -> AXWindow? {
-        if let focused = driver.focusedWindow(),
-           allowsOwnWindows || focused.key.pid != getpid(),
-           let frame = driver.frame(of: focused.element),
-           frame.insetBy(dx: -Constants.releaseSlack, dy: -Constants.releaseSlack).contains(point) {
-            return focused
+        let windows = driver.visibleWindows()
+        let hit = windows.first { $0.frame.contains(point) } ?? windows.first {
+            $0.frame.insetBy(dx: -Constants.releaseSlack, dy: -Constants.releaseSlack).contains(point)
         }
-        // Focus does not always follow a drag (inactive windows, apps that take a
-        // moment to activate). Fall back to the frontmost window that contains the
-        // release point; the dragged window is on top, so it wins.
-        let candidates = driver.allWindows().filter { allowsOwnWindows || $0.key.pid != getpid() }
-        for window in candidates {
-            guard let frame = driver.frame(of: window.element) else { continue }
-            if frame.insetBy(dx: -Constants.releaseSlack, dy: -Constants.releaseSlack).contains(point) {
-                log?("drag: using \(window.displayName) under the pointer, not the focused window")
-                return window
-            }
-        }
-        log?("drag: no window under \(point)")
-        return nil
+        guard let hit, allowsOwnWindows || hit.window.pid != getpid() else { return nil }
+        return driver.resolve(hit.window, in: hit.frame)
     }
 
-    private func commit(window: AXWindow, slot: Slot, screen: ScreenInfo, swapFrom: Slot?) {
+    private func commit(window: AXWindow, slot: Slot, screen: ScreenInfo, swapFrom: Slot?, afterLocalTracking: Bool) {
         if let swapFrom, swapFrom != slot {
             log?("drag: snapping \(window.key.title) to \(slot.label), swapping from \(swapFrom.label)")
         } else {
             log?("drag: snapping \(window.key.title) to \(slot.label)")
         }
-        // AppKit drags windows in a nested event-tracking loop: a main-queue block
-        // runs *during* that loop and the drag then overrides our frame on its way
-        // out. Scheduling in the default mode defers the move until the drag is over.
+        // An external app owns its own event-tracking loop. Its global mouse-up
+        // can snap immediately. Only our local monitor must wait for AppKit to
+        // finish tracking a Sightline window before writing that window's frame.
+        guard afterLocalTracking else {
+            snaps.perform(window: window, slot: slot, screen: screen, swapFrom: swapFrom)
+            return
+        }
         RunLoop.main.perform(inModes: [.default]) { [snaps] in
             MainActor.assumeIsolated {
                 _ = snaps.perform(window: window, slot: slot, screen: screen, swapFrom: swapFrom)
             }
         }
-    }
-
-    private func dismiss() {
-        guard session != nil else { return }
-        reset()
+        CFRunLoopWakeUp(CFRunLoopGetMain())
     }
 
     private func reset() {
@@ -306,17 +270,14 @@ final class DragSnap {
 
     // MARK: - Geometry
 
-    private func pointer() -> CGPoint {
+    private func pointer(for event: NSEvent) -> CGPoint {
+        if let point = event.cgEvent?.location { return point }
         let ns = NSEvent.mouseLocation
         return CGPoint(x: ns.x, y: displays.systemPrimaryHeight - ns.y)
     }
 
     private func boards(for screen: ScreenInfo) -> [(Slot, CGRect)] {
-        let geo = screen.geometry(prefs.layout(for: screen.id))
-        let seen = Set(Slot.allCases.map { geo.canonical($0) })
-        return seen.compactMap { slot in
-            geo.rect(for: slot).map { (slot, $0) }
-        }
+        screen.geometry(prefs.layout(for: screen.id)).boards
     }
 
     private func slot(at point: CGPoint, screen: ScreenInfo, boards: [(Slot, CGRect)]) -> Slot? {
@@ -338,9 +299,9 @@ final class DragSnap {
 
 // MARK: - Overlay
 
-/// A click-through panel over one screen showing the five boards while ⌥ is held.
+/// Shared, non-activating preview for a pending drag or keyboard swap.
 @MainActor
-private final class DragOverlay {
+final class BoardOverlay {
     private var panel: NSPanel?
     private var view: BoardView?
 
@@ -360,7 +321,7 @@ private final class DragOverlay {
         }
         view.update(boards: local, highlight: highlight, size: frame.size)
 
-        if panel.frame.size != frame.size {
+        if panel.frame != frame {
             panel.setFrame(frame, display: false)
         }
         if !panel.isVisible {
@@ -374,13 +335,7 @@ private final class DragOverlay {
     }
 
     func hide() {
-        guard let panel, panel.isVisible else { return }
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.12
-            panel.animator().alphaValue = 0
-        }, completionHandler: {
-            panel.orderOut(nil)
-        })
+        if let panel, panel.isVisible { panel.orderOut(nil) }
     }
 
     private func ensurePanel() -> (NSPanel, BoardView)? {

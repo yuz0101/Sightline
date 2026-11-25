@@ -165,6 +165,13 @@ public struct LayoutGeometry: Sendable {
         }
     }
 
+    public var boards: [(Slot, CGRect)] {
+        Slot.allCases.compactMap { slot in
+            guard canonical(slot) == slot, let rect = rects[slot] else { return nil }
+            return (slot, rect)
+        }
+    }
+
     public func rect(for slot: Slot) -> CGRect? {
         rects[canonical(slot)]
     }

@@ -15,7 +15,6 @@ final class SettingsModel: ObservableObject {
 
     @Published private(set) var screen: ScreenInfo?
     @Published private(set) var trusted: Bool = Accessibility.isTrusted
-    @Published private(set) var unavailable: [HotKeyAction] = []
 
     private let prefs: Preferences
     private let displays: DisplayRegistry
@@ -44,11 +43,8 @@ final class SettingsModel: ObservableObject {
     }
 
     func refreshTrust() {
-        trusted = Accessibility.isTrusted
-    }
-
-    func setUnavailable(_ actions: [HotKeyAction]) {
-        unavailable = actions
+        let current = Accessibility.isTrusted
+        if current != trusted { trusted = current }
     }
 
     var layout: ScreenLayout {

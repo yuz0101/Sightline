@@ -12,11 +12,10 @@ struct SettingsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     if !model.trusted { permissionCard }
-                    if !model.unavailable.isEmpty { conflictCard }
                     screenCard
                     layoutCard
                     quickMenuCard
-                    shortcutsCard
+                    swapGestureCard
                 }
                 .padding(20)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -36,7 +35,7 @@ struct SettingsView: View {
     private var header: some View {
         HStack(alignment: .center) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("Sightline")
+                Text(Accessibility.appName)
                     .font(.system(size: 20, weight: .semibold))
                 Text("Attention-weighted boards for a wide display")
                     .font(.system(size: 11))
@@ -98,30 +97,10 @@ struct SettingsView: View {
                         Button("Open System Settings") { Accessibility.openSystemSettings() }
                         Button("Check Again") { model.refreshTrust() }
                     }
-                    Text("Enable Sightline in Privacy & Security → Accessibility, then press Check Again.")
+                    Text("In Privacy & Security → Accessibility, turn on \(Accessibility.appName). If you don’t see it, click + and select \(Bundle.main.bundleURL.path).")
                         .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                }
-            }
-        }
-    }
-
-    private var conflictCard: some View {
-        card {
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "keyboard.badge.ellipsis")
-                    .foregroundStyle(.orange)
-                    .font(.system(size: 16))
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Some shortcuts are already taken")
-                        .font(.system(size: 13, weight: .semibold))
-                    Text("Another app — often Rectangle or Magnet — holds these combinations. Quit or rebind it, then relaunch Sightline.")
-                        .font(.system(size: 11))
                         .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text(model.unavailable.map(\.shortcut).joined(separator: "   "))
-                        .font(.system(size: 11, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
                 }
             }
         }
@@ -221,48 +200,16 @@ struct SettingsView: View {
         }
     }
 
-    private var shortcutsCard: some View {
+    private var swapGestureCard: some View {
         card {
-            VStack(alignment: .leading, spacing: 10) {
-                sectionHeader(
-                    "Keyboard",
-                    detail: "Global shortcuts — they work while any app is focused, no menu-bar trip required."
-                )
-                LazyVGrid(
-                    columns: [
-                        GridItem(.fixed(76), alignment: .trailing),
-                        GridItem(.flexible(), alignment: .leading),
-                    ],
-                    alignment: .leading,
-                    spacing: 7
-                ) {
-                    ForEach(shortcutActions, id: \.rawValue) { action in
-                        Text(action.shortcut)
-                            .font(.system(size: 11, weight: .medium, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                        Text(action.title)
-                            .font(.system(size: 11))
-                    }
-                }
-                Text("Also in the menu bar: save and restore arrangements, fill screen, centre at current size, and per-preset layouts.")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .padding(.top, 2)
-            }
+            sectionHeader(
+                "Swap with centre",
+                detail: "Hold Control and Command, then press ← or → to highlight a window on that side. If the side is split, choose the upper or lower window with ↑ or ↓. Release either modifier to swap. Repeat to switch back."
+            )
         }
     }
 
     // MARK: - Pieces
-
-    private var shortcutActions: [HotKeyAction] {
-        [
-            .placeCenter, .placeLeftTop, .placeLeftBottom, .placeRightTop, .placeRightBottom,
-            .hopLeft, .hopRight, .hopUp, .hopDown,
-            .cycleForward, .cycleBackward, .stageFocused,
-            .toggleSplit, .nudgeNarrower, .nudgeWider,
-            .presetPrevious, .presetNext, .openSettings,
-        ]
-    }
 
     private var footnote: String {
         guard let metrics = model.metrics, let screen = model.screen else {
